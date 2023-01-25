@@ -74,6 +74,7 @@ struct tcp_segment_info {
 
 // コントロールブロックの構造体
 struct tcp_pcb {
+    int active; // listen: 0, syn-sent: 1
     int state; // コネクションの状態
     struct ip_endpoint local;   // コネクションの両端のアドレス情報
     struct ip_endpoint foreign; // 
@@ -96,6 +97,7 @@ struct tcp_pcb {
     uint32_t irs;
     uint16_t mtu;
     uint16_t mss;
+
     // uint8_t buf[65535]; /* receive buffer */
     uint8_t buf[16]; /* receive buffer */
     struct sched_ctx ctx;
@@ -353,6 +355,10 @@ static void tcp_retransmit_queue_emit(void *arg, void *data) {
     }
 }
 
+static void tcp_retransmit_queue_emit_all(struct tcp_pcb *pcb) {
+    queue_foreach(&pcb->queue, tcp_retransmit_queue_emit, pcb);
+}
+
 // TCPの送信関数
 static ssize_t tcp_output(struct tcp_pcb *pcb, uint8_t flg, uint8_t *data, size_t len) {
     uint32_t seq;
@@ -440,7 +446,15 @@ static void tcp_segment_arrives(struct tcp_segment_info *seg, uint8_t flags, uin
                     acceptable = 1;
             }
             /* 2nd check the RST bit */
-
+            if (TCP_FLG_ISSET(flags, TCP_FLG_RST)) {
+                if (acceptable) {
+                    errorf("error: connection reset");
+                }
+                pcb->state = TCP_PCB_STATE_CLOSED;
+                sched_wakeup(&pcb->ctx);
+                tcp_pcb_release(pcb);
+                return;
+            }
             /* 3rd check security and precedence */
 
             /* 4th check the SYN bit */
@@ -530,11 +544,56 @@ static void tcp_segment_arrives(struct tcp_segment_info *seg, uint8_t flags, uin
     */
 
     /* 2nd check the RST bit */
-
+    if (TCP_FLG_ISSET(flags, TCP_FLG_RST)) {
+        switch (pcb->state) {
+            case TCP_PCB_STATE_SYN_RECEIVED:
+                // RSTからの影響を受ける
+                if (pcb->active) {
+                    errorf("error: connection refused");
+                    pcb->state = TCP_PCB_STATE_CLOSED;
+                    tcp_pcb_release(pcb);
+                } else {
+                    pcb->state = TCP_PCB_STATE_LISTEN;
+                }
+                return;
+            case TCP_PCB_STATE_ESTABLISHED:
+            case TCP_PCB_STATE_FIN_WAIT1:
+            case TCP_PCB_STATE_FIN_WAIT2:
+            case TCP_PCB_STATE_CLOSE_WAIT:
+                // any outstanding RECEIVEs and SEND should receive "reset" responses.  
+                // All segment queues should be flushed.  
+                tcp_retransmit_queue_emit_all(pcb);
+                // Users should also receive an unsolicited general "connection reset" signal.
+                pcb->state = TCP_PCB_STATE_CLOSED;
+                tcp_pcb_release(pcb);
+                return;
+            case TCP_PCB_STATE_CLOSING:
+            case TCP_PCB_STATE_LAST_ACK:
+            case TCP_PCB_STATE_TIME_WAIT:
+                pcb->state = TCP_PCB_STATE_CLOSED;
+                tcp_pcb_release(pcb);
+                return;
+        }
+    }
     /* 3rd check security and precedence (ignore) */
 
     /* 4th check the SYN bit */
-
+    if (TCP_FLG_ISSET(flags, TCP_FLG_SYN)) {
+        switch (pcb->state) {
+            case TCP_PCB_STATE_SYN_RECEIVED:
+            case TCP_PCB_STATE_ESTABLISHED:
+            case TCP_PCB_STATE_FIN_WAIT1:
+            case TCP_PCB_STATE_FIN_WAIT2:
+            case TCP_PCB_STATE_CLOSE_WAIT:
+            case TCP_PCB_STATE_CLOSING:
+            case TCP_PCB_STATE_LAST_ACK:
+            case TCP_PCB_STATE_TIME_WAIT:
+                tcp_retransmit_queue_emit_all(pcb);
+                pcb->state = TCP_PCB_STATE_CLOSED;
+                tcp_pcb_release(pcb);
+                return;
+        }
+    }
     /* 5th check the ACK field */
     if (!TCP_FLG_ISSET(flags, TCP_FLG_ACK)) {
         // if the ACK bit is off drop the segment and return
@@ -736,7 +795,7 @@ static void tcp_timer(void) {
         if (pcb->state == TCP_PCB_STATE_FREE)
             continue;
         // 受信キューの全てのエントリに対してtcp_retransmit_queue_emit()を実行する
-        queue_foreach(&pcb->queue, tcp_retransmit_queue_emit, pcb);
+        tcp_retransmit_queue_emit_all(pcb);
     }
     mutex_unlock(&mutex);
 }
@@ -789,6 +848,7 @@ int tcp_open_rfc793(struct ip_endpoint *local, struct ip_endpoint *foreign, int 
         mutex_unlock(&mutex);
         return -1;
     }
+    pcb->active = active;
     // 能動的なオープン
     if (active) {
         debugf("active open: local=%s, foreign=%s, connecting...",
