@@ -40,6 +40,8 @@
 
 #define TCP_DEFAULT_RTO 200000 /* micro seconds */
 #define TCP_RETRANSMIT_DEADLINE 12 /* seconds */
+#define TCP_USER_TIMEOUT_TIME 30 /* seconds */
+#define TCP_MSL 120 /* seconds */
 
 // 疑似ヘッダの構造体（チェックサム計算時に使用する）
 struct pseudo_hdr {
@@ -97,7 +99,8 @@ struct tcp_pcb {
     uint32_t irs;
     uint16_t mtu;
     uint16_t mss;
-
+    struct timeval start_time;
+    struct timeval time_wait;
     // uint8_t buf[65535]; /* receive buffer */
     uint8_t buf[16]; /* receive buffer */
     struct sched_ctx ctx;
@@ -703,13 +706,15 @@ static void tcp_segment_arrives(struct tcp_segment_info *seg, uint8_t flags, uin
                 sched_wakeup(&pcb->ctx);
                 break;
             case TCP_PCB_STATE_FIN_WAIT1:
-                if (seg->ack == pcb->snd.nxt)
+                if (seg->ack == pcb->snd.nxt) {
                     pcb->state = TCP_PCB_STATE_TIME_WAIT;
-                else
+                    gettimeofday(&pcb->time_wait, NULL);
+                } else
                     pcb->state = TCP_PCB_STATE_CLOSING;
                 break;
             case TCP_PCB_STATE_FIN_WAIT2:
                 pcb->state = TCP_PCB_STATE_TIME_WAIT;
+                gettimeofday(&pcb->time_wait, NULL);
                 break;
             case TCP_PCB_STATE_CLOSE_WAIT:
                 break;
@@ -787,7 +792,8 @@ static void tcp_input(const uint8_t *data, size_t len, ip_addr_t src, ip_addr_t 
     return;
 }
 
-static void tcp_timer(void) {
+// 再送のタイマー
+static void tcp_retransmit_timer(void) {
     struct tcp_pcb *pcb;
 
     mutex_lock(&mutex);
@@ -796,6 +802,52 @@ static void tcp_timer(void) {
             continue;
         // 受信キューの全てのエントリに対してtcp_retransmit_queue_emit()を実行する
         tcp_retransmit_queue_emit_all(pcb);
+    }
+    mutex_unlock(&mutex);
+}
+
+// USER TIMEOUT
+static void tcp_user_timeout(void) {
+    struct tcp_pcb *pcb;
+    struct timeval now, diff;
+
+    mutex_lock(&mutex);
+    for (pcb = pcbs; pcb < tailof(pcbs); pcb++) {
+        if (pcb->state == TCP_PCB_STATE_FREE || pcb->state == TCP_PCB_STATE_TIME_WAIT)
+            continue;
+        
+        // ソケット生成からの経過時間を計算
+        gettimeofday(&now, NULL);
+        timersub(&now, &pcb->start_time, &diff);
+        // USER TIMEOUTの判定
+        if (diff.tv_sec >= TCP_USER_TIMEOUT_TIME) {
+            tcp_retransmit_queue_emit_all(pcb);
+            errorf("error: connection aborted due to user timeout");
+            pcb->state = TCP_PCB_STATE_CLOSED;
+            tcp_pcb_release(pcb);
+        }
+    }
+    mutex_unlock(&mutex);
+}
+
+// WAIT TIME TIMEOUT
+static void tcp_time_wait_timeout(void) {
+    struct tcp_pcb *pcb;
+    struct timeval now, diff;
+
+    mutex_lock(&mutex);
+    for (pcb = pcbs; pcb < tailof(pcbs); pcb++) {
+        if (pcb->state != TCP_PCB_STATE_TIME_WAIT)
+            continue;
+        
+        // ソケット生成からの経過時間を計算
+        gettimeofday(&now, NULL);
+        timersub(&now, &pcb->time_wait, &diff);
+        // TIME WAIT TIMEOUTの判定
+        if (diff.tv_sec >= 2 * TCP_MSL) {
+            pcb->state = TCP_PCB_STATE_CLOSED;
+            tcp_pcb_release(pcb);
+        }
     }
     mutex_unlock(&mutex);
 }
@@ -813,7 +865,10 @@ static void event_handler(void *arg) {
 }
 
 int tcp_init(void) {
-    struct timeval interval = {0, 100000};
+    struct timeval retransmit_interval = {0, 100000};
+    struct timeval user_timeout_interval = {0, 1000000};
+    struct timeval tcp_time_wait_interval = {0, 1000000};
+    // struct timeval interval = {0, 10};
 
     if (ip_protocol_register(IP_PROTOCOL_TCP, tcp_input) == -1) {
         errorf("ip_protocol_register() failure");
@@ -821,10 +876,21 @@ int tcp_init(void) {
     }
     net_event_subscribe(event_handler, NULL);
     
-    if (net_timer_register(interval, tcp_timer) == -1) {
+    if (net_timer_register(retransmit_interval, tcp_retransmit_timer) == -1) {
         errorf("net_timer_register() failure");
         return -1;
     }
+
+    if (net_timer_register(user_timeout_interval, tcp_user_timeout) == -1) {
+        errorf("net_timer_register() failure");
+        return -1;
+    }
+
+    if (net_timer_register(tcp_time_wait_interval, tcp_time_wait_timeout) == -1) {
+        errorf("net_timer_register() failure");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -849,6 +915,7 @@ int tcp_open_rfc793(struct ip_endpoint *local, struct ip_endpoint *foreign, int 
         return -1;
     }
     pcb->active = active;
+    gettimeofday(&pcb->start_time, NULL);
     // 能動的なオープン
     if (active) {
         debugf("active open: local=%s, foreign=%s, connecting...",
@@ -1049,7 +1116,6 @@ RETRY_RECEIVE:
     // bufに収まる分だけコピー
     len = MIN(size, remain);
     memcpy(buf, pcb->buf, len);
-    infof("-------------------------------len=%d", len);
     // コピー済みのデータをバッファから消す
     memmove(pcb->buf, pcb->buf + len, remain - len);
     pcb->rcv.wnd += len;

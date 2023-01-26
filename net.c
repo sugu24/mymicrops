@@ -241,7 +241,7 @@ int net_timer_handler(void) {
         if (timercmp(&timer->interval, &diff, <) != 0) {
             // 登録されている関数を呼び出す
             timer->handler();
-
+            
             // 最後の発火時間を更新
             timer->last = now;
         }
